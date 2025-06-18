@@ -34,7 +34,18 @@ from diffusion_policy.plain_conv import PlainConv
 from diffusion_policy.utils import (IterationBasedBatchSampler,
                                     build_state_obs_extractor, convert_obs,
                                     worker_init_fn)
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
+def setup(rank, world_size):
+    dist.init_process_group(
+        backend="nccl",  # 使用NCCL后端（推荐用于GPU）
+        init_method="env://",
+        rank=rank,
+        world_size=world_size
+    )
+    torch.cuda.set_device(rank)
 
 @dataclass
 class Args:
@@ -100,7 +111,7 @@ class Args:
     """the number of episodes to evaluate the agent on"""
     num_eval_envs: int = 10
     """the number of parallel environments to evaluate the agent on"""
-    sim_backend: str = "physx_cpu"
+    sim_backend: str = "physx_gpu"
     """the simulation backend to use for evaluation environments. can be "cpu" or "gpu"""
     num_dataload_workers: int = 0
     """the number of workers to use for loading the training data in the torch dataloader"""
@@ -113,8 +124,6 @@ class Args:
     test_mode: bool = False
     """whether to train the model or evaluate the model"""
 
-    gpu_id: int = 0  # 默认使用显卡0
-    """指定使用的GPU设备ID"""
 def reorder_keys(d, ref_dict):
     out = dict()
     for k, v in ref_dict.items():
@@ -192,7 +201,6 @@ class SmallDemoDataset_DiffusionPolicy(Dataset):  # Load everything into memory
             assert trajectories["observations"][traj_idx]["state"].shape[0] == L + 1
             total_transitions += L
             # 这个地方显示了模型的时序
-            # 所以是prev_frame和cur_frame
             # |o|o|                             observations: 2
             # | |a|a|a|a|a|a|a|a|               actions executed: 8
             # |p|p|p|p|p|p|p|p|p|p|p|p|p|p|p|p| actions predicted: 16
@@ -320,8 +328,14 @@ class Agent(nn.Module):
         return feature.flatten(start_dim=1)  # (B, obs_horizon * (D+obs_state_dim))
 
     def compute_loss(self, obs_seq, action_seq):
-        B = obs_seq["state"].shape[0]
+        # 扩散模型的核心思想是学习逆转噪声添加过程
 
+        # 训练过程是前向过程 是加噪声的：
+        # 逐步添加noise到action
+        # 根据obs和noise_action(state?)预测noise
+        # 最小化noise与pred_noise的均方误差
+        B = obs_seq["state"].shape[0]
+        print("obs_seq shape: ",obs_seq["state"].shape)
         # observation as FiLM conditioning
         obs_cond = self.encode_obs(
             obs_seq, eval_mode=False
@@ -347,6 +361,13 @@ class Agent(nn.Module):
         return F.mse_loss(noise_pred, noise)
 
     def get_action(self, obs_seq):
+        # 反向过程：
+        # 训练过程是反向过程 是去噪的：
+        # 初始化 init_noise
+        # 根据cur_noise与obs预测当前noise
+        # 添加noise到 cur_noise
+        # 最终的cur_noise就是最终的action   
+        
         # init scheduler
         # self.noise_scheduler.set_timesteps(self.num_diffusion_iters)
         # set_timesteps will change noise_scheduler.timesteps is only used in noise_scheduler.step()
@@ -392,6 +413,9 @@ class Agent(nn.Module):
 
 
 def save_ckpt(run_name, tag):
+    if local_rank != 0:  # 只在主进程保存
+        return
+
     os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
     ema.copy_to(ema_agent.parameters())
     torch.save(
@@ -408,12 +432,11 @@ def evaluate_model(args, run_name, envs, device):
     save_on_best_metrics = ["success_once", "success_at_end"]
 
     if os.path.exists(checkpoint_dir):
-        checkpoint_files = '0.pt'
+        checkpoint_files = 'best_eval_' + save_on_best_metrics[1] + '.pt'
         print(checkpoint_files)
         if checkpoint_files:
             # 加载检查点
             checkpoint_path = os.path.join(checkpoint_dir, checkpoint_files)
-            print("Checkpoint path:", checkpoint_path)
             checkpoint = torch.load(checkpoint_path)
             print("Checkpoint keys:", checkpoint.keys())
             # 创建评估用的agent
@@ -442,8 +465,10 @@ def evaluate_model(args, run_name, envs, device):
 
 if __name__ == "__main__":
 
-    # 记录程序开始时间
-    total_start_time = time.time()
+    # 获取分布式参数
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    setup(local_rank, world_size)
 
     args = tyro.cli(Args)
 
@@ -476,7 +501,8 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    device = torch.device(f"cuda:{local_rank}")
 
     # create evaluation environment
     env_kwargs = dict(
@@ -552,18 +578,39 @@ if __name__ == "__main__":
         device=device,
         num_traj=args.num_demos
     )
-    sampler = RandomSampler(dataset, replacement=False)
+    # sampler = RandomSampler(dataset, replacement=False)
+    # batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)
+    # batch_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
+    # train_dataloader = DataLoader(
+    #     dataset,
+    #     batch_sampler=batch_sampler,
+    #     num_workers=args.num_dataload_workers,
+    #     worker_init_fn=lambda worker_id: worker_init_fn(worker_id, base_seed=args.seed),
+    #     persistent_workers=(args.num_dataload_workers > 0),
+    # )
+
+    # 修改采样器
+    sampler = DistributedSampler(
+        dataset, 
+        num_replicas=world_size,
+        rank=local_rank,
+        shuffle=True
+    )
     batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)
     batch_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
+
     train_dataloader = DataLoader(
         dataset,
         batch_sampler=batch_sampler,
         num_workers=args.num_dataload_workers,
-        worker_init_fn=lambda worker_id: worker_init_fn(worker_id, base_seed=args.seed),
+        worker_init_fn=lambda worker_id: worker_init_fn(worker_id, base_seed=args.seed + local_rank),
         persistent_workers=(args.num_dataload_workers > 0),
     )
 
-    agent = Agent(envs, args).to(device)
+    # agent = Agent(envs, args).to(device)
+    # 修改模型创建部分
+    agent = Agent(envs, args).to(local_rank)
+    agent = DDP(agent, device_ids=[local_rank])
 
     optimizer = optim.AdamW(
         params=agent.parameters(), lr=args.lr, betas=(0.95, 0.999), weight_decay=1e-6
@@ -580,14 +627,21 @@ if __name__ == "__main__":
     # Exponential Moving Average
     # accelerates training and improves stability
     # holds a copy of the model weights
-    ema = EMAModel(parameters=agent.parameters(), power=0.75)
-    ema_agent = Agent(envs, args).to(device)
+    # ema = EMAModel(parameters=agent.parameters(), power=0.75)
+    # ema_agent = Agent(envs, args).to(device)
+
+    # 修改EMA初始化
+    ema = EMAModel(parameters=agent.module.parameters(), power=0.75)
+    ema_agent = Agent(envs, args).to(local_rank)
 
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)
 
     # define evaluation and logging functions
     def evaluate_and_save_best(iteration):
+        if local_rank != 0:  # 非主进程不执行评估
+            return
+        
         if iteration % args.eval_freq == 0:
             last_tick = time.time()
             ema.copy_to(ema_agent.parameters())
@@ -630,16 +684,19 @@ if __name__ == "__main__":
 
     agent.train()
     pbar = tqdm(total=args.total_iters)
-    train_start_time = time.time()
     last_tick = time.time()
     for iteration, data_batch in enumerate(train_dataloader):
         timings["data_loading"] += time.time() - last_tick
 
         # forward and compute loss
         last_tick = time.time()
-        total_loss = agent.compute_loss(
-            obs_seq=data_batch["observations"],  # obs_batch_dict['state'] is (B, L, obs_dim)
-            action_seq=data_batch["actions"],  # (B, L, act_dim)
+        # total_loss = agent.compute_loss(
+        #     obs_seq=data_batch["observations"],  # obs_batch_dict['state'] is (B, L, obs_dim)
+        #     action_seq=data_batch["actions"],  # (B, L, act_dim)
+        # )
+        total_loss = agent.module.compute_loss(  # 添加 .module
+            obs_seq=data_batch["observations"],
+            action_seq=data_batch["actions"],
         )
         timings["forward"] += time.time() - last_tick
 
@@ -670,23 +727,6 @@ if __name__ == "__main__":
     evaluate_and_save_best(args.total_iters)
     log_metrics(args.total_iters)
 
+    dist.destroy_process_group()
     envs.close()
     writer.close()
-
-    # 计算并打印总运行时间
-    total_end_time = time.time()
-    total_duration = total_end_time - total_start_time
-    train_duration = total_end_time - train_start_time
-    other_duration = total_duration - train_duration
-
-    def format_time(seconds):
-        """将秒数格式化为小时-分钟-秒字符串"""
-        hours, rem = divmod(seconds, 3600)
-        minutes, seconds = divmod(rem, 60)
-        return f"{int(hours):02d}:{int(minutes):02d}:{seconds:06.3f}"
-
-    print(f"\n{'='*30}")
-    print(f"程序总运行时间: {format_time(total_duration)}")
-    print(f"训练阶段耗时: {format_time(train_duration)}")
-    print(f"评估/保存耗时: {format_time(other_duration)}")
-    print(f"{'='*30}")

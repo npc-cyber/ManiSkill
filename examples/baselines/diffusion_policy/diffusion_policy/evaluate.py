@@ -11,6 +11,9 @@ def evaluate(n: int, agent, eval_envs, device, sim_backend: str, progress_bar: b
     with torch.no_grad():
         eval_metrics = defaultdict(list)
         obs, info = eval_envs.reset()
+        # print(obs.keys())
+        # for k,v in obs.items():
+        #     print(k,v.shape)
         eps_count = 0
         while eps_count < n:
             obs = common.to_tensor(obs, device)
